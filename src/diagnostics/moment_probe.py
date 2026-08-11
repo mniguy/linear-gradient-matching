@@ -46,6 +46,13 @@ class MomentProbeCfg(Tap):
     num_batches: int = 20
     heads_per_batch: int = 8
 
+    # the mean-only substitution is a no-op for a class holding a single sample,
+    # which would make the cosine trivially 1. Restrict the compared rows to
+    # classes with at least this many samples in the batch.
+    min_per_class: int = 4
+
+    forward_chunk: int = 100  # backbone forward is chunked, as in baselines/centroids.py
+
     # 0.01 is the default in models/linear_classifier.py
     head_stds: List[float] = [0.01, 0.1, 1.0]
 
@@ -90,10 +97,12 @@ def cos(a: Tensor, b: Tensor) -> float:
 
 
 def compare(
-    ref: Tuple[Tensor, Tensor], other: Tuple[Tensor, Tensor]
+    ref: Tuple[Tensor, Tensor],
+    other: Tuple[Tensor, Tensor],
+    rows: Tensor,
 ) -> Dict[str, float]:
-    gw_r, gb_r = ref
-    gw_o, gb_o = other
+    gw_r, gb_r = ref[0][rows], ref[1][rows]
+    gw_o, gb_o = other[0][rows], other[1][rows]
 
     # the shared (1/C) * z_bar term is identical in every row of dL/dW, so it can
     # inflate the cosine on its own; subtracting the row mean isolates the
@@ -125,7 +134,9 @@ def main(cfg: MomentProbeCfg):
     )
     num_classes = train_dataset.num_classes
 
-    batch_size = cfg.batch_size or min(1000, cfg.augs_per_batch * num_classes)
+    # matches the real batch distillation uses: ipc * augs_per_batch * num_classes
+    # (no cap -- the forward is chunked)
+    batch_size = cfg.batch_size or cfg.augs_per_batch * num_classes
 
     loader = DataLoader(
         train_dataset,
@@ -152,11 +163,14 @@ def main(cfg: MomentProbeCfg):
         x = x.cuda(non_blocking=True)
         y = y.cuda(non_blocking=True)
 
-        # same forward path as get_real_grad (linear_gm.py:199-208)
+        # same forward path as get_real_grad (linear_gm.py:199-208), but chunked so
+        # that large batches (needed for enough samples per class) do not OOM
         with autocast(enabled=True):
             x = augmentor(x)
             x = train_dataset.normalize(x)
-            z = model(x)
+            z = torch.cat(
+                [model(chunk) for chunk in torch.split(x, cfg.forward_chunk)]
+            )
 
         # gradient math in fp32 so the cosines are not fp16 noise
         z = z.float()
@@ -166,6 +180,24 @@ def main(cfg: MomentProbeCfg):
         n_over_N = counts / z.shape[0]
 
         z_meanonly = mu[y]
+
+        # classes holding a single sample make the substitution a no-op, so the
+        # cosine would be 1 regardless of the mechanism under test
+        rows = counts >= cfg.min_per_class
+        if rows.sum() < 2:
+            raise RuntimeError(
+                f"only {int(rows.sum())} classes have >= {cfg.min_per_class} samples "
+                f"in a batch of {z.shape[0]} over {num_classes} classes. "
+                "Raise --batch_size or lower --min_per_class."
+            )
+
+        # how much the substitution actually perturbs the features; if this is ~0
+        # the test is vacuous no matter what the cosines say
+        populated = rows[y]
+        perturbation = (
+            (z[populated] - z_meanonly[populated]).norm(dim=1).mean()
+            / z[populated].norm(dim=1).mean()
+        ).item()
 
         # a random non-zero cyclic shift: guaranteed to have no fixed point, unlike
         # randperm, which is the identity half the time when num_classes == 2
@@ -190,23 +222,37 @@ def main(cfg: MomentProbeCfg):
 
             record = {
                 "head_std": std,
-                "meanonly": compare(g_real, g_meanonly),
-                "analytic": compare(g_real, (gw_analytic, gb_analytic)),
-                "shuffled": compare(g_real, g_shuffled),
+                "meanonly": compare(g_real, g_meanonly, rows),
+                "analytic": compare(g_real, (gw_analytic, gb_analytic), rows),
+                "shuffled": compare(g_real, g_shuffled, rows),
                 "softmax_entropy_ratio": (entropy / np.log(num_classes)).item(),
                 "softmax_max_prob": p.max(dim=1).values.mean().item(),
                 "logit_std": (z @ W.t() + b).std().item(),
                 "feat_norm_mean": z.norm(dim=1).mean().item(),
+                # validity diagnostics -- read these before the cosines
+                "perturbation_ratio": perturbation,
+                "compared_classes": float(rows.sum().item()),
+                "samples_per_class": float(counts[rows].mean().item()),
+                "singleton_frac": float((counts == 1).float().mean().item()),
             }
             records.append(record)
 
-    summary = summarize(records, cfg)
+    summary = summarize(records, cfg, batch_size)
     report(summary, cfg, num_classes)
     return summary
 
 
-def summarize(records: List[dict], cfg: MomentProbeCfg) -> dict:
-    summary = {"config": {"dataset": cfg.dataset, "model": cfg.model}, "by_std": {}}
+def summarize(records: List[dict], cfg: MomentProbeCfg, batch_size: int) -> dict:
+    summary = {
+        "config": {
+            "dataset": cfg.dataset,
+            "model": cfg.model,
+            "batch_size": batch_size,
+            "min_per_class": cfg.min_per_class,
+            "num_batches": cfg.num_batches,
+        },
+        "by_std": {},
+    }
 
     for std in cfg.head_stds:
         rows = [r for r in records if r["head_std"] == std]
@@ -220,6 +266,10 @@ def summarize(records: List[dict], cfg: MomentProbeCfg) -> dict:
             "softmax_max_prob",
             "logit_std",
             "feat_norm_mean",
+            "perturbation_ratio",
+            "compared_classes",
+            "samples_per_class",
+            "singleton_frac",
         ]:
             vals = [r[key] for r in rows]
             entry[key] = [float(np.mean(vals)), float(np.std(vals))]
@@ -230,8 +280,18 @@ def summarize(records: List[dict], cfg: MomentProbeCfg) -> dict:
 
 def report(summary: dict, cfg: MomentProbeCfg, num_classes: int):
 
+    cfg_summary = summary["config"]
+    first = summary["by_std"][str(cfg.head_stds[0])]
+
     print("\n" + "=" * 78)
     print(f"B1 probe | dataset={cfg.dataset} model={cfg.model} C={num_classes}")
+    print(
+        f"batch={cfg_summary['batch_size']} "
+        f"compared_classes={first['compared_classes'][0]:.0f}/{num_classes} "
+        f"samples_per_class={first['samples_per_class'][0]:.1f} "
+        f"singleton_frac={first['singleton_frac'][0]:.3f} "
+        f"perturbation={first['perturbation_ratio'][0]:.4f}"
+    )
     print("=" * 78)
 
     header = (
@@ -273,7 +333,16 @@ def report(summary: dict, cfg: MomentProbeCfg, num_classes: int):
             "dataset (e.g. cub2011) before trusting the control."
         )
 
-    if sh_ctr > 0.5:
+    perturbation = default["perturbation_ratio"][0]
+
+    if perturbation < 0.05:
+        print(
+            f"VACUOUS: the mean-only substitution moves features by only "
+            f"{perturbation:.4f} of their norm ({default['samples_per_class'][0]:.1f} "
+            "samples per compared class). The cosine is ~1 by construction, not by "
+            "mechanism. Raise --batch_size and re-run."
+        )
+    elif sh_ctr > 0.5:
         print(
             f"INVALID: shuffled control is {sh_ctr:.3f} (>0.5). The cosine is not "
             "discriminative here; do not read the other columns."
@@ -308,7 +377,8 @@ if __name__ == "__main__":
 
     os.makedirs(cfg.out_dir, exist_ok=True)
     out_file = os.path.join(
-        cfg.out_dir, f"moment_probe_{cfg.dataset}_{cfg.model}.json"
+        cfg.out_dir,
+        f"moment_probe_{cfg.dataset}_{cfg.model}_bs{summary['config']['batch_size']}.json",
     )
     with open(out_file, "w") as f:
         json.dump(summary, f, indent=2)
