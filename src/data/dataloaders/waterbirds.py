@@ -60,6 +60,14 @@ class Waterbirds(BaseRealDataset):
         self.targets = self.get_targets()
         self.full_ds.targets = self.targets
 
+        # background attribute, for subgroup analysis only
+        # deliberately not exposed through __getitem__ so distillation never sees it
+        metadata = self.ds.metadata_array
+        assert torch.equal(
+            metadata[:, 1].long(), self.targets.long()
+        ), "unexpected WILDS metadata layout for waterbirds"
+        self.backgrounds = metadata[:, 0].long().clone()
+
     def __getitem__(self, index):
 
         image, label, background = self.ds.__getitem__(index)
