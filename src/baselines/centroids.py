@@ -22,19 +22,23 @@ def get_centroid_images(
     crop = kornia.augmentation.CenterCrop(224)
     real_neighbors = []
     for y in tqdm(labels):
-        real_images = train_dataset.get_single_class(y.item()).cuda()
+        # kept on cpu: a single class can be thousands of images, and normalizing
+        # or cropping the whole stack on gpu at once exhausts vram
+        real_images = train_dataset.get_single_class(y.item())
 
-        normalized_real_images = train_dataset.normalize(real_images)
-        cropped_real_images = crop(normalized_real_images)
-
-        real_embeddings = torch.cat(
-            [model(chunk) for chunk in torch.split(cropped_real_images, 100)]
-        )
+        real_embeddings = []
+        for chunk in torch.split(real_images, 100):
+            chunk = chunk.cuda()
+            chunk = train_dataset.normalize(chunk)
+            chunk = crop(chunk)
+            real_embeddings.append(model(chunk))
+        real_embeddings = torch.cat(real_embeddings)
         mean_embedding = torch.mean(real_embeddings, dim=0, keepdim=True)
 
         distances = torch.norm(real_embeddings - mean_embedding, dim=1)
 
-        nearest_idx = torch.argmin(distances)
+        # .item() because distances live on gpu while real_images stays on cpu
+        nearest_idx = torch.argmin(distances).item()
         nearest_image = real_images[nearest_idx].clone()
 
         real_neighbors.append(nearest_image)
