@@ -20,6 +20,7 @@ class Spawrious(BaseRealDataset):
         crop_res: int = 256,
         crop_mode: Literal["center", "random"] = "center",
         data_root: str = "data/datasets",
+        benchmark: str = "o2o_hard",
     ):
 
         super().__init__()
@@ -58,7 +59,7 @@ class Spawrious(BaseRealDataset):
         sp.SpawriousBenchmark.input_shape = (3, res, res)
 
         spawrious_benchmark = sp.SpawriousBenchmark(
-            "o2o_hard", f"{data_root}/spawrious", augment=False
+            benchmark, f"{data_root}/spawrious", augment=False
         )
 
         self.num_classes = 4

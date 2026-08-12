@@ -85,13 +85,18 @@ def get_dataset(
                 data_root=data_root,
             )
 
-        case "spawrious":
+        # "spawrious" keeps the o2o_hard default; "spawrious_<variant>" picks another,
+        # e.g. spawrious_m2m_hard. Keeping the variant in the dataset name means each
+        # one lands in its own logged_files directory instead of colliding.
+        case s if s.startswith("spawrious"):
+            benchmark = s[len("spawrious_") :] if s.startswith("spawrious_") else "o2o_hard"
             train_dataset = Spawrious(
                 split="train",
                 res=res,
                 crop_res=res,
                 crop_mode=train_crop_mode,
                 data_root=data_root,
+                benchmark=benchmark,
             )
             test_dataset = Spawrious(
                 split="test",
@@ -99,6 +104,7 @@ def get_dataset(
                 crop_res=crop_res,
                 crop_mode="center",
                 data_root=data_root,
+                benchmark=benchmark,
             )
 
         case "waterbirds":
