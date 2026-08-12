@@ -67,6 +67,7 @@ class Waterbirds(BaseRealDataset):
             metadata[:, 1].long(), self.targets.long()
         ), "unexpected WILDS metadata layout for waterbirds"
         self.backgrounds = metadata[:, 0].long().clone()
+        self.attribute_names = ["land bg", "water bg"]
 
     def __getitem__(self, index):
 

@@ -53,7 +53,11 @@ class GroupEvalCfg(Tap):
 
 
 def get_groups(test_dataset) -> Tuple[Tensor, List[str]]:
-    """group = 2 * label + background, following the standard Waterbirds split."""
+    """group = label * num_attributes + spurious attribute."""
+    # spawrious computes targets lazily, and the same pass fills in `backgrounds`
+    if getattr(test_dataset, "targets", None) is None:
+        test_dataset.targets = test_dataset.get_targets()
+
     if not hasattr(test_dataset, "backgrounds"):
         raise NotImplementedError(
             f"{type(test_dataset).__name__} does not expose subgroup labels. "
@@ -62,13 +66,13 @@ def get_groups(test_dataset) -> Tuple[Tensor, List[str]]:
 
     y = test_dataset.targets.long()
     b = test_dataset.backgrounds.long()
-    groups = 2 * y + b
+    num_attributes = int(b.max().item()) + 1
+    groups = y * num_attributes + b
 
-    names = [
-        f"{cls} on {bg}"
-        for cls in test_dataset.class_names
-        for bg in ["land bg", "water bg"]
-    ]
+    attr_names = getattr(
+        test_dataset, "attribute_names", [f"attr {a}" for a in range(num_attributes)]
+    )
+    names = [f"{cls} on {attr}" for cls in test_dataset.class_names for attr in attr_names]
     return groups, names
 
 
@@ -85,15 +89,18 @@ def predict(model: nn.Module, fc: nn.Module, loader: DataLoader, normalize) -> T
     return torch.cat(preds)
 
 
-def group_accuracies(preds: Tensor, labels: Tensor, groups: Tensor) -> List[float]:
+def group_accuracies(preds: Tensor, labels: Tensor, groups: Tensor, num_groups: int) -> List[float]:
+    """nan for groups with no test samples -- spawrious leaves many combinations empty."""
     correct = (preds == labels).float()
-    return [
-        correct[groups == g].mean().item() for g in range(int(groups.max().item()) + 1)
-    ]
+    accs = []
+    for g in range(num_groups):
+        mask = groups == g
+        accs.append(correct[mask].mean().item() if mask.any() else float("nan"))
+    return accs
 
 
 def run_once(cfg: GroupEvalCfg, syn_loader, test_loader, model, num_feats,
-             train_dataset, labels, groups, seed: int) -> Tuple[float, List[float]]:
+             train_dataset, labels, groups, group_names, seed: int) -> Tuple[float, List[float]]:
 
     torch.manual_seed(seed)
     random.seed(seed)
@@ -157,7 +164,7 @@ def run_once(cfg: GroupEvalCfg, syn_loader, test_loader, model, num_feats,
         else:
             patience_counter = 0
             best_avg = avg
-            best_groups = group_accuracies(preds, labels, groups)
+            best_groups = group_accuracies(preds, labels, groups, len(group_names))
 
     return best_avg, best_groups
 
@@ -210,11 +217,11 @@ def main(cfg: GroupEvalCfg):
         print(f"\n--- run {i + 1}/{cfg.num_eval} ---")
         avg, g_accs = run_once(
             cfg, syn_loader, test_loader, eval_model, num_feats,
-            train_dataset, labels, groups, seed=3407 + i,
+            train_dataset, labels, groups, group_names, seed=3407 + i,
         )
         avgs.append(avg)
         per_group.append(g_accs)
-        worsts.append(min(g_accs))
+        worsts.append(np.nanmin(g_accs))
 
     per_group = np.array(per_group)
 
@@ -224,8 +231,11 @@ def main(cfg: GroupEvalCfg):
     print("=" * 70)
     for i, name in enumerate(group_names):
         n = int((groups == i).sum().item())
+        if n == 0:
+            print(f"  {name:<28} n=0      (empty -- excluded)")
+            continue
         print(f"  {name:<28} n={n:<6} "
-              f"{per_group[:, i].mean() * 100:6.2f} +- {per_group[:, i].std() * 100:.2f}")
+              f"{np.nanmean(per_group[:, i]) * 100:6.2f} +- {np.nanstd(per_group[:, i]) * 100:.2f}")
     print("-" * 70)
     print(f"  {'AVERAGE':<28} {'':<8}"
           f"{np.mean(avgs) * 100:6.2f} +- {np.std(avgs) * 100:.2f}")
@@ -240,8 +250,8 @@ def main(cfg: GroupEvalCfg):
         "worst_mean": float(np.mean(worsts)),
         "worst_std": float(np.std(worsts)),
         "group_names": group_names,
-        "group_mean": per_group.mean(axis=0).tolist(),
-        "group_std": per_group.std(axis=0).tolist(),
+        "group_mean": np.nanmean(per_group, axis=0).tolist(),
+        "group_std": np.nanstd(per_group, axis=0).tolist(),
     }
     os.makedirs(cfg.out_dir, exist_ok=True)
     out_file = os.path.join(

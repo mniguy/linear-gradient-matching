@@ -91,11 +91,18 @@ class Spawrious(BaseRealDataset):
 
     def get_targets(self) -> Tensor:
         targets = []
+        backgrounds = []
         loader = DataLoader(self.ds, num_workers=16, batch_size=16)
         for image, label, background in tqdm.tqdm(loader, desc="Getting targets..."):
             targets.append(label)
+            backgrounds.append(
+                background if torch.is_tensor(background) else torch.as_tensor(background)
+            )
 
         targets = torch.cat(targets)
+        # spurious attribute, for subgroup analysis only
+        # deliberately not exposed through __getitem__ so distillation never sees it
+        self.backgrounds = torch.cat(backgrounds).long()
         return targets
 
     def get_single_class(self, cls: int) -> Tensor:
@@ -111,7 +118,8 @@ class Spawrious(BaseRealDataset):
         images = []
         labels = []
         print(f"Loading all {num_samples} images for class {cls}...")
-        for x, y in loader:
+        # the underlying spawrious dataset yields (image, label, background)
+        for x, y, _ in loader:
             images.append(x)
             labels.append(y)
         images = torch.cat(images)
